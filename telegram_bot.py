@@ -1,37 +1,24 @@
 #!/usr/bin/env python3
 """
 Bot de Cursos — Telegram
-Corre no Railway (cloud, independente do Mac)
-
-Variáveis de ambiente necessárias no Railway:
-  TELEGRAM_TOKEN
-  SUPABASE_URL
-  SUPABASE_KEY
-  ANTHROPIC_KEY
+Corre no Railway (sem dependências pesadas de ML)
 """
 
-import os
-import logging
+import os, logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client
-from fastembed import TextEmbedding
 import anthropic
 
 logging.basicConfig(level=logging.INFO)
 
-# ─── CREDENCIAIS (via Railway env vars) ──────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 SUPABASE_URL   = os.environ["SUPABASE_URL"]
 SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 ANTHROPIC_KEY  = os.environ["ANTHROPIC_KEY"]
-# ─────────────────────────────────────────────────────────────────────────────
 
-print("A carregar modelos...")
-embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
-supa        = create_client(SUPABASE_URL, SUPABASE_KEY)
-claude      = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-print("✅ Pronto!")
+supa   = create_client(SUPABASE_URL, SUPABASE_KEY)
+claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 def fmt_time(seconds):
     m = int(seconds) // 60
@@ -41,19 +28,19 @@ def fmt_time(seconds):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📚 *Bot de Cursos*\n\n"
-        "Faz qualquer pergunta sobre o conteúdo dos teus vídeos.\n\n"
+        "Faz qualquer pergunta sobre os teus vídeos.\n\n"
         "Exemplos:\n"
         "• _O que o Hormozi diz sobre pricing?_\n"
         "• _Como criar um hook eficaz?_\n"
-        "• _Melhores estratégias para escalar uma app?_\n\n"
-        "Digo-te exactamente em qual vídeo e a que minuto encontras a resposta.",
+        "• _Como escalar uma app mobile?_\n\n"
+        "Digo-te exactamente em qual vídeo e a que minuto.",
         parse_mode="Markdown"
     )
 
 async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    r = supa.table("transcricoes").select("video_nome", count="exact").execute()
+    r = supa.table("transcricoes").select("video_nome").execute()
     videos = len(set(row["video_nome"] for row in r.data)) if r.data else 0
-    segs   = r.count or 0
+    segs   = len(r.data) if r.data else 0
     await update.message.reply_text(
         f"📊 *Base de conhecimento*\n\n"
         f"🎬 Vídeos indexados: {videos}\n"
@@ -63,17 +50,34 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     question = update.message.text
-    msg = await update.message.reply_text("🔍 A pesquisar na base de conhecimento...")
+    msg = await update.message.reply_text("🔍 A pesquisar...")
 
     try:
-        # Gerar embedding da pergunta
-        q_emb = list(embed_model.embed([question]))[0].tolist()
+        # Passo 1: Claude extrai palavras-chave em inglês
+        kw_resp = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=80,
+            messages=[{"role": "user", "content":
+                f"Extract 5-8 English search keywords from this question. "
+                f"Return ONLY the keywords separated by spaces, nothing else: {question}"
+            }]
+        )
+        keywords = kw_resp.content[0].text.strip()
 
-        # Pesquisar no Supabase
-        result = supa.rpc("buscar_segmentos", {
-            "query_embedding": q_emb,
-            "match_count": 10
+        # Passo 2: Pesquisa full-text no Supabase
+        result = supa.rpc("buscar_texto", {
+            "query_text": keywords,
+            "max_results": 12
         }).execute()
+
+        # Fallback: se texto não encontrar, busca por ilike
+        if not result.data:
+            first_kw = keywords.split()[0] if keywords else question
+            result = supa.table("transcricoes") \
+                .select("video_nome, start_time, end_time, texto") \
+                .ilike("texto", f"%{first_kw}%") \
+                .limit(10) \
+                .execute()
 
         if not result.data:
             await msg.edit_text(
@@ -82,18 +86,14 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Montar contexto para o Claude
+        # Passo 3: Montar contexto
         context = ""
-        seen = set()
         for r in result.data:
-            key = f"{r['video_nome']}_{r['start_time']}"
-            if key in seen: continue
-            seen.add(key)
             start = fmt_time(r["start_time"])
             end   = fmt_time(r["end_time"])
             context += f"[{r['video_nome']} — {start} → {end}]\n{r['texto']}\n\n"
 
-        # Pedir resposta ao Claude
+        # Passo 4: Claude sintetiza resposta
         await msg.edit_text("🧠 A formular resposta...")
         response = claude.messages.create(
             model="claude-sonnet-4-6",
@@ -103,17 +103,15 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 PERGUNTA: {question}
 
-EXCERTOS RELEVANTES DOS VÍDEOS:
+EXCERTOS DOS VÍDEOS:
 {context}
 
-Responde de forma directa, prática e em português.
-Sintetiza o que os vídeos dizem sobre o tema.
-No final, indica SEMPRE os vídeos e timestamps relevantes neste formato exacto:
-
+Responde em português de forma directa e prática.
+Sintetiza o que os vídeos ensinam sobre o tema.
+No final indica sempre os vídeos e timestamps relevantes no formato:
 📍 nome_do_video.mp4 — MM:SS → MM:SS"""
             }]
         )
-
         await msg.edit_text(response.content[0].text)
 
     except Exception as e:
